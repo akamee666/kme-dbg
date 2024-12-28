@@ -1,0 +1,18 @@
+[package]
+name = "kme-dbg"
+version = "0.1.0"
+edition = "2021"
+authors = ["Davi Aguiar moraes@akmee.xyz"]
+description = "Debugger yayy"
+# license = "MIT"
+readme = "README.md"
+repository = "https://github.com/akamee666/kme-dbg"
+
+# keywords = ["cli", "tracker", "spyware"]
+# categories = ["command-line-utilities"]
+
+[dependencies]
+eframe = { version = "0.30.0", features = ["default"] }
+egui_extras = { version = "0.30.0", features = ["default", "image"] }
+tracing = "0.1.40"
+tracing-subscriber = {version="0.3.18", features = ["env-filter"]  }
