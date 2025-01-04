@@ -11,6 +11,7 @@ Breakpoints are not that hard i guess
 [Learning about debuggers](https://werat.dev/blog/learning-about-debuggers/)
 
 
+tbh i gonna keep reading about debuggers until i get a pretty good idea of how i should code this :)
 
 ## Todo
 
