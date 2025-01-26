@@ -12,7 +12,11 @@ repository = "https://github.com/akamee666/kme-dbg"
 # categories = ["command-line-utilities"]
 
 [dependencies]
-eframe = { version = "0.30.0", features = ["default"] }
-egui_extras = { version = "0.30.0", features = ["default", "image"] }
+clap = { version = "4.5.18", features = ["derive"] }
+nix = { version = "0.29.0", features = ["ptrace"] }
 tracing = "0.1.40"
 tracing-subscriber = {version="0.3.18", features = ["env-filter"]  }
+# I'm yet to decide how i am going to do the GUI.
+# eframe = { version = "0.30.0", features = ["default"] }
+# egui_extras = { version = "0.30.0", features = ["default", "image"] }
+

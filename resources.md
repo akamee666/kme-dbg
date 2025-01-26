@@ -15,9 +15,13 @@ tbh i gonna keep reading about debuggers until i get a pretty good idea of how i
 
 ## Todo
 
-- [ ] Create a GUI would be a good start.
 - [ ] Start requested process?
+  - [ ] fork
+  - [ ]
 - [ ] Learn how debuggers are made because my understand of this topic is poor.
 - [ ] Display opcode, address, and instructions.
 - [ ] Breakpoints i guess.
 - [ ] What more, dont really know.
+- [ ] Create a GUI would be a good start.
+
+

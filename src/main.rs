@@ -1,62 +1,89 @@
-use eframe::egui;
-
 mod logger;
+
+use clap::Arg;
 
 use tracing::*;
 
-fn main() -> eframe::Result {
-    logger::init();
-    info!("Hello");
-    warn!("Hello from warn");
-    debug!("Hello from debug");
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "My egui App",
-        options,
-        Box::new(|cc| {
-            // This gives us image support:
-            egui_extras::install_image_loaders(&cc.egui_ctx);
+use std::path::{Path, PathBuf};
+use std::{os::unix::process::CommandExt, process::*};
 
-            Ok(Box::<MyApp>::default())
-        }),
-    )
-}
+use nix::{
+    sys::{ptrace, wait::waitpid},
+    unistd::{fork, ForkResult, Pid},
+};
 
-struct MyApp {
-    name: String,
-    age: u32,
-}
+fn main() {
+    let matches = clap::Command::new("debugger")
+        .about("A simple Linux debugger")
+        .arg(
+            Arg::new("bin")
+                .help("The binary to debug")
+                .required(true)
+                .index(1),
+        )
+        .arg(
+            Arg::new("verbose")
+                .help("Enable verbose output")
+                .short('v')
+                .long("verbose")
+                .action(clap::ArgAction::SetTrue), // Sets the value to `true` if the flag is present
+        )
+        .get_matches();
 
-impl Default for MyApp {
-    fn default() -> Self {
-        Self {
-            name: "Arthur".to_owned(),
-            age: 42,
+    let target_executable = matches
+        .get_one::<String>("bin")
+        .expect("Binary name is required");
+
+    let verbose = matches.get_flag("verbose");
+    logger::init(verbose);
+
+    // Resolve the binary path to an absolute path
+    let target_path = Path::new(target_executable);
+    let resolved_path = std::fs::canonicalize(target_path).unwrap_or_else(|err| {
+        error!("Failed to resolve binary path: {}", err);
+        std::process::exit(1);
+    });
+
+    info!("Verbose mode: {}", verbose);
+    info!("Resolved the target binary path: {:?}", resolved_path);
+
+    // Here we have two ways to start the target process:
+    // 1. Command::new -> Get_pid -> ptrace::attach(child_pid);
+    // 2. Fork -> Replace the process with the target binary -> ptrace::traceme();
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child, .. }) => trace_child(child),
+        Ok(ForkResult::Child) => {
+            run_child(resolved_path);
         }
+        Err(_) => println!("Fork failed"),
     }
 }
 
-impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("My egui Application");
-            ui.horizontal(|ui| {
-                let name_label = ui.label("Your name: ");
-                ui.text_edit_singleline(&mut self.name)
-                    .labelled_by(name_label.id);
-            });
-            ui.add(egui::Slider::new(&mut self.age, 0..=120).text("age"));
-            if ui.button("Increment").clicked() {
-                self.age += 1;
-            }
-            ui.label(format!("Hello '{}', age {}", self.name, self.age));
+fn trace_child(forked_child: Pid) {
+    info!("kme_dbg is executing with pid: [{}]", std::process::id());
 
-            //ui.image(egui::include_image!(
-            //    "../../../crates/egui/assets/ferris.png"
-            //));
-        });
-    }
+    let ws = waitpid(forked_child, None).expect("Parent failed waiting for child");
+    info!("Child process stopped with status: {:?}", ws);
+
+    ptrace::cont(forked_child, None).expect("cont failed");
+
+    // exited;
+    let ws = waitpid(forked_child, None).expect("Parent failed waiting for child");
+    info!("Child process stopped with status: {:?}", ws);
+}
+
+fn run_child(target_path: PathBuf) {
+    info!(
+        "Target executable was successfully forked, pid: [{}]",
+        std::process::id()
+    );
+
+    // Indicates that this process is to be traced by its parent.
+    // This is the only ptrace request to be issued by the tracee.
+    // I personally dont see any scenario where it can failed
+    ptrace::traceme().expect("Failed when asking to be traced");
+
+    Command::new(target_path).exec();
+
+    unreachable!("Failed to execute the target executable");
 }
