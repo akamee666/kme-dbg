@@ -13,6 +13,7 @@ repository = "https://github.com/akamee666/kme-dbg"
 
 [dependencies]
 clap = { version = "4.5.18", features = ["derive"] }
+iced-x86 = "1.21.0"
 nix = { version = "0.29.0", features = ["ptrace"] }
 tracing = "0.1.40"
 tracing-subscriber = {version="0.3.18", features = ["env-filter"]  }
