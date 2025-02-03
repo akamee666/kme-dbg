@@ -1,7 +1,8 @@
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::{filter, fmt, prelude::*};
+use tracing::info;
 
 use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter, fmt, prelude::*};
 
 use std::time::SystemTime;
 
@@ -32,6 +33,8 @@ pub fn init(enable_debug: bool) {
         let env_filter_std = EnvFilter::new("info").add_directive("kme_dbg=info".parse().unwrap());
         registry(env_filter_std, enable_debug);
     }
+
+    info!("Verbose enabled: {}", enable_debug);
 }
 
 fn registry(env_filter_std: EnvFilter, enable_debug: bool) {
