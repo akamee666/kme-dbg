@@ -66,15 +66,10 @@ fn main() {
     }
 }
 
-/// From bat's rust code:
-/// Returns `Err(..)` upon fatal errors. Otherwise, returns `Ok(true)` on full success and
-/// `Ok(false)` if any intermediate errors occurred (were printed).
+/// Returns `Err(..)` upon fatal errors. Otherwise, will never return (by now).
 fn run(exe: PathBuf) -> Result<bool, DebuggerError> {
     log::info!("Exe: {:?}", exe);
     let mut dbg = Debugger::launch(exe)?;
-    let _entry_point = dbg.find_entrypoint()?;
-    // dbg.set_breakpoint(entry_point as u64)?; // for some reason this does not work.
     dbg.wait_for_signal()?;
-
-    Ok(true)
+    unreachable!();
 }
