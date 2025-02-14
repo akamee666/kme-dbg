@@ -55,17 +55,21 @@ pub enum DebuggerError {
 #[derive(Error, Debug)]
 pub enum BreakpointError {
     #[error("Failed to read memory at address 0x{address:x}")]
-    MemoryReadFailed { address: u64, source: nix::Error },
+    MemoryRead { address: u64, source: nix::Error },
 
     #[error("Failed to write breakpoint at address 0x{address:x}")]
-    MemoryWriteFailed { address: u64, source: nix::Error },
+    MemoryWrite { address: u64, source: nix::Error },
+
+    #[error("Error while restoring the instruction from a breakpoint at address 0x{address:x}")]
+    RestoreInstruction { address: u64, source: nix::Error },
 }
 
 pub struct Debugger {
-    // In the x86 and x86-64 architectures, the maximum instruction length is 15 bytes. This limit is defined by the architecture itself
-    breakpoints: HashMap<u64, u16>, // Address and the replaced byte.
+    // u8 is used because 0xCC only replace one byte.
+    breakpoints: HashMap<u64, u8>, // Address and the replaced byte.
     debugee_pid: Pid,
     exe: PathBuf,
+    first_sigtrap: bool,
 }
 
 pub enum Arch {
@@ -105,7 +109,7 @@ impl Debugger {
                 Ok(debugger)
             }
             ForkResult::Child => {
-                debug!("Process forked, Child's PID is [{}].", std::process::id());
+                log::debug!("Process forked, Child's PID is [{}].", std::process::id());
 
                 ptrace::traceme().map_err(DebuggerError::SystemError)?;
 
@@ -122,38 +126,46 @@ impl Debugger {
             breakpoints: HashMap::new(),
             debugee_pid: p,
             exe,
+            first_sigtrap: true,
         }
     }
 
     pub fn set_breakpoint(&mut self, address: u64) -> Result<(), BreakpointError> {
-        // Read original instruction
         let orig_byte = match ptrace::read(self.debugee_pid, address as *mut _) {
             Ok(byte) => byte,
             Err(e) => {
-                return Err(BreakpointError::MemoryReadFailed { address, source: e });
+                return Err(BreakpointError::MemoryRead { address, source: e });
             }
         };
 
         let breakpoint_instruction = (orig_byte & !0xff) | INT3 as i64;
 
-        ptrace::write(self.debugee_pid, address as *mut _, breakpoint_instruction)
-            .map_err(|source| BreakpointError::MemoryWriteFailed { address, source })?;
+        log::debug!("Setting breakpoint:");
+        log::debug!("Address: 0x{:x}", address);
+        log::debug!("Original instruction: 0x{:x}", orig_byte);
+        log::debug!("Breakpoint instruction: 0x{:x}", breakpoint_instruction);
 
-        self.breakpoints.insert(address, orig_byte as u16);
+        ptrace::write(self.debugee_pid, address as *mut _, breakpoint_instruction)
+            .map_err(|source| BreakpointError::MemoryWrite { address, source })?;
+
+        self.breakpoints.insert(address, orig_byte as u8);
 
         Ok(())
     }
     pub fn remove_breakpoint(&mut self, address: u64) -> Result<(), DebuggerError> {
         if let Some(orig_byte) = self.breakpoints.remove(&address) {
             ptrace::write(self.debugee_pid, address as *mut _, orig_byte as i64)?;
-            debug!("Breakpoint removed from address 0x{:x}", address);
+            log::debug!("Breakpoint removed from address 0x{:x}", address);
         }
         Ok(())
     }
 
     pub fn wait_for_signal(&mut self) -> Result<(), DebuggerError> {
-        debug!("Debugger is executing with pid: [{}]", std::process::id());
-        debug!("Started waiting for child's signal.");
+        log::debug!("Debugger is executing with pid: [{}]", std::process::id());
+        log::debug!("Started waiting for child's signal.");
+
+        // The debugge process did not started yet, so i am not able to put breakpoints here.
+        // self.break_entrypoint()?;
 
         loop {
             // Wait until our debugee process change status.
@@ -161,6 +173,7 @@ impl Debugger {
 
             // Maybe i should check the type of error here.
             self.handle_child_status(status)?;
+            log::debug!("Waiting again.");
         }
     }
 
@@ -190,7 +203,9 @@ impl Debugger {
                 self.set_breakpoint(ep)?;
             }
             ET_EXEC => {
-                debug!("PIE not enabled, attempting to set breakpoint using raw header address.");
+                log::debug!(
+                    "PIE not enabled, attempting to set breakpoint using raw header address."
+                );
                 self.set_breakpoint(ep as u64)?;
             }
 
@@ -250,7 +265,7 @@ impl Debugger {
                 fd.read_exact_at(&mut header, 0x18)?;
 
                 let addr = u64::from_le_bytes(header);
-                log::info!("EntryPoint at 0x{:x}", addr);
+                log::info!("EntryPoint at 0x{:x}", addr); // why is it printing as 32bit.
                 return Ok(addr as usize);
             }
             Arch::Invalid => {
@@ -261,13 +276,36 @@ impl Debugger {
         Ok(0)
     }
 
-    fn handle_stopped_process(&mut self, _pid: Pid, signal: Signal) -> Result<(), DebuggerError> {
-        // FIX: It only works after the first TRAP is received but if i keep it here it would put a
-        // breakpoint every stopped signal.
-        self.break_entrypoint()?;
-
+    fn handle_stopped_process(&mut self, pid: Pid, signal: Signal) -> Result<(), DebuggerError> {
+        // put rip back one byte.
+        // get the original byte back.
+        // continue execution.
         if signal == Signal::SIGTRAP {
+            let mut regs = ptrace::getregs(pid)?;
+            log::debug!(
+                "We stopped at a sigtrap, rip is currently: 0x{:x}",
+                regs.rip
+            );
+
+            // Put rip back one byte because it just executed the replaced INT3 instruction.
+            regs.rip -= 0x01;
+
+            let current_instruction = ptrace::read(self.debugee_pid, regs.rip as *mut _)?;
+
+            // Unless we get a SIGTRAP for a breakpoint that we didn't put, unwrap will not panic.
+            let original_instruction =
+                (current_instruction & !0xff) | *self.breakpoints.get(&regs.rip).unwrap() as i64;
+
+            ptrace::setregs(pid, regs)?;
+            ptrace::write(pid, regs.rip as *mut _, original_instruction).map_err(|source| {
+                BreakpointError::RestoreInstruction {
+                    address: regs.rip,
+                    source,
+                }
+            })?;
+
             self.print_current_instruction()?;
+
             loop {
                 print!("(kme-dbg) :: ");
 
@@ -280,7 +318,7 @@ impl Debugger {
                 }
             }
         } else {
-            debug!("Unhandled stop signal: {:?}", signal);
+            log::debug!("Unhandled stop signal: {:?}", signal);
         }
 
         Ok(())
@@ -291,38 +329,51 @@ impl Debugger {
             WaitStatus::Exited(pid, exit_code) => {
                 // TODO: Should not finish here and instead let a option to rerun or attach a new
                 // binary.
-                debug!("Child process {} exited with code: {}", pid, exit_code);
+                log::debug!("Child process {} exited with code: {}", pid, exit_code);
                 std::process::exit(0);
             }
             WaitStatus::Signaled(pid, signal, core_dumped) => {
-                debug!(
+                log::debug!(
                     "Child process {} was killed by signal: {:?} (core dumped: {})",
-                    pid, signal, core_dumped
+                    pid,
+                    signal,
+                    core_dumped
                 );
                 // TODO: Same thing as above, maybe return a specific error and handle it when returned
                 // to let the debugger not finish.
             }
             WaitStatus::Stopped(pid, signal) => {
-                debug!("Child process {} was stopped by signal: {:?}", pid, signal);
+                // WARN: I'll remove it later.
+                if self.first_sigtrap {
+                    self.break_entrypoint()?;
+                    log::debug!("First Sigtrap, ignoring it to let the process start.");
+                    self.first_sigtrap = false;
+                    ptrace::cont(pid, None)?;
+                    return Ok(());
+                }
+
+                log::debug!("Child process {} was stopped by signal: {:?}", pid, signal);
                 let addr = ptrace::getregs(pid)?.rip;
-                debug!("Stopped at address: 0x{addr:x}");
+                log::debug!("Stopped at address: 0x{addr:x}");
 
                 self.handle_stopped_process(pid, signal)?;
             }
             WaitStatus::PtraceEvent(pid, signal, event) => {
-                debug!(
+                log::debug!(
                     "Child process {} received ptrace event: {} (signal: {:?})",
-                    pid, event, signal
+                    pid,
+                    event,
+                    signal
                 );
             }
             WaitStatus::PtraceSyscall(pid) => {
-                debug!("Child process {} entered a syscall", pid);
+                log::debug!("Child process {} entered a syscall", pid);
             }
             WaitStatus::Continued(pid) => {
-                debug!("Child process {} continued", pid);
+                log::debug!("Child process {} continued", pid);
             }
             WaitStatus::StillAlive => {
-                debug!("Child process is still alive");
+                log::debug!("Child process is still alive");
             }
         }
         Ok(())
@@ -336,16 +387,16 @@ impl Debugger {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         match parts.first().copied() {
             Some("si") | Some("step_into") => {
-                debug!("Stepping into next instruction");
+                log::debug!("Stepping into next instruction");
                 ptrace::step(self.debugee_pid, None)?;
                 Ok(false)
             }
             Some("so") | Some("step_over") => {
-                debug!("Stepping over next instruction");
+                log::debug!("Stepping over next instruction");
                 let debugee_regs = ptrace::getregs(self.debugee_pid)?;
 
                 let word = ptrace::read(self.debugee_pid, debugee_regs.rip as *mut _)? as u8;
-                debug!("Current instruction byte: 0x{:x}", word);
+                log::debug!("Current instruction byte: 0x{:x}", word);
 
                 let is_call_opcode: bool = matches!(word, 0xE8 | 0xFF | 0x9A);
                 if is_call_opcode {
@@ -361,7 +412,7 @@ impl Debugger {
                 // WARN: :D
                 // I wrote this while checking the oven for my vegetables so it's probably not
                 // working the way it should
-                debug!("Running until return");
+                log::debug!("Running until return");
                 let debugee_regs = ptrace::getregs(self.debugee_pid)?;
                 let return_opcodes = [0xC3, 0xCB, 0xC2, 0xCA];
                 let mut instruction_bytes = [0u8; 16];
@@ -369,13 +420,13 @@ impl Debugger {
                     let word =
                         ptrace::read(self.debugee_pid, (debugee_regs.rip as usize + i) as *mut _)?;
 
-                    debug!("Current instruction byte: 0x{:x}", word);
+                    log::debug!("Current instruction byte: 0x{:x}", word);
 
                     for byte_opcode in return_opcodes.iter() {
                         if word == *byte_opcode {
-                            debug!("Return instruction");
+                            log::debug!("Return instruction");
                         } else {
-                            debug!("Not return");
+                            log::debug!("Not return");
                         }
                     }
                     *byte = word as u8;
@@ -384,7 +435,7 @@ impl Debugger {
                 Ok(false)
             }
             Some("c") | Some("continue") => {
-                debug!("Continuing execution");
+                log::debug!("Continuing execution");
                 ptrace::cont(self.debugee_pid, None)?;
                 Ok(false)
             }
@@ -395,7 +446,7 @@ impl Debugger {
             Some("b") | Some("break") => {
                 if let Some(addr_str) = parts.get(1) {
                     if let Ok(addr) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16) {
-                        debug!("Trying to set breakpoint at: 0x{:x}", addr);
+                        log::debug!("Trying to set breakpoint at: 0x{:x}", addr);
                         self.set_breakpoint(addr)?;
                     }
                 }
@@ -414,7 +465,7 @@ impl Debugger {
                 Ok(true)
             }
             Some("q") | Some("quit") => {
-                debug!("Exiting debugger");
+                log::debug!("Exiting debugger");
                 std::process::exit(0);
             }
             Some(cmd) => {
@@ -440,7 +491,7 @@ impl Debugger {
 
     pub fn print_registers(&self) -> Result<(), DebuggerError> {
         let regs = ptrace::getregs(self.debugee_pid)?;
-        debug!(
+        log::debug!(
             "Registers:\n\
             RAX: 0x{:016x}  RBX: 0x{:016x}  RCX: 0x{:016x}\n\
             RDX: 0x{:016x}  RSI: 0x{:016x}  RDI: 0x{:016x}\n\
@@ -477,9 +528,10 @@ impl Debugger {
 
         while current_bp != 0 && frame_count < 20 {
             let return_addr = ptrace::read(self.debugee_pid, (current_bp + 8) as *mut _)? as u64;
-            debug!(
+            log::debug!(
                 "Frame #{}: return address = 0x{:x}",
-                frame_count, return_addr
+                frame_count,
+                return_addr
             );
 
             current_bp = ptrace::read(self.debugee_pid, current_bp as *mut _)? as u64;
@@ -501,12 +553,14 @@ impl Debugger {
             *byte = word as u8;
         }
 
+        log::debug!("Instruction bytes: [{instruction_bytes:x?}]");
+
         let mut decoder = Decoder::with_ip(64, &instruction_bytes, rip, DecoderOptions::NONE);
         let mut formatter = NasmFormatter::new();
         let mut output = String::new();
         formatter.format(&decoder.decode(), &mut output);
 
-        debug!("Current instruction at 0x{:x}: {}", rip, output);
+        log::debug!("Current instruction at 0x{:x}: {}", rip, output);
         Ok(())
     }
 }
