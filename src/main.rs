@@ -66,7 +66,9 @@ fn main() {
 /// Returns `Err(..)` upon fatal errors. Otherwise, will never return (by now).
 fn run(exe: PathBuf) -> Result<(), DebuggerError> {
     log::info!("Exe: {:?}", exe);
-    let mut dbg = Debugger::launch(exe)?;
+    let exe_data = std::fs::read(exe.clone())?;
+    let elf_bytes = exe_data.as_slice();
+    let mut dbg = Debugger::launch(elf_bytes, exe)?;
     dbg.wait_for_signal()?;
     unreachable!();
 }

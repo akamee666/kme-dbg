@@ -1,21 +1,21 @@
+use elf::endian::EndianParse;
+use elf::ParseError;
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
 use nix::{sys::ptrace, unistd::Pid};
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Write;
+use std::io::{self};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
-use std::{collections::HashMap, fmt::Debug};
-
-use tracing::*;
+use std::path::PathBuf;
 
 use tracing as log;
-
-use std::io::Write;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use tracing::*;
 
 use nix::{
     errno::Errno,
@@ -26,12 +26,12 @@ use nix::{
     unistd::{fork, ForkResult},
 };
 
+use elf::endian::AnyEndian;
+use elf::ElfBytes;
+
 use thiserror::Error;
 
 const INT3: u8 = 0xcc;
-const ET_DYN: u16 = 0x03;
-const ET_EXEC: u16 = 0x02;
-const ELF_TYPE: u64 = 0x10;
 
 #[derive(Error, Debug)]
 #[allow(dead_code)]
@@ -50,6 +50,8 @@ pub enum DebuggerError {
     SystemError(#[from] Errno),
     #[error("Could not find the Base Address reading \"/proc/<proc>/maps\" due to: {0}")]
     BaseAddressError(String),
+    #[error("Failed to parse data from ELF due to: {0}")]
+    ElfParserError(#[from] ParseError),
 }
 
 #[derive(Error, Debug)]
@@ -64,48 +66,29 @@ pub enum BreakpointError {
     RestoreInstruction { address: u64, source: nix::Error },
 }
 
-pub struct Debugger {
+pub struct Debugger<'a, E>
+where
+    E: EndianParse,
+{
     // u8 is used because 0xCC only replace one byte.
     breakpoints: HashMap<u64, u8>, // Address and the replaced byte.
     debugee_pid: Pid,
-    exe: PathBuf,
+    elf: ElfBytes<'a, E>,
     first_sigtrap: bool,
 }
 
-pub enum Arch {
-    B32,
-    B64,
-    Invalid,
-}
+impl<'a> Debugger<'a, AnyEndian> {
+    // elf_data needs a lifetime 'a because ElfBytes holds a reference to elf raw sliced data
+    // inside it.
+    pub fn launch(elf_data: &'a [u8], exe: PathBuf) -> Result<Self, DebuggerError> {
+        // Parse Elf information.
+        // If it does not fail we have a valid ELF.
+        let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_data)?;
 
-pub trait FileArch {
-    fn get_arch(&mut self) -> Arch;
-}
-
-impl FileArch for File {
-    fn get_arch(&mut self) -> Arch {
-        let mut header = [0u8; 5]; // First 5 bytes-- magic and arch.
-
-        let _ = self.read_exact(&mut header);
-
-        if header[0..4] != [0x7F, b'E', b'L', b'F'] {
-            return Arch::Invalid;
-        }
-
-        match header[4] {
-            0x01 => Arch::B32,
-            0x02 => Arch::B64,
-            _ => Arch::Invalid,
-        }
-    }
-}
-
-impl Debugger {
-    pub fn launch(exe: PathBuf) -> Result<Self, DebuggerError> {
         let f = unsafe { fork().map_err(DebuggerError::SystemError)? };
         match f {
             ForkResult::Parent { child } => {
-                let debugger = Debugger::init(child, exe);
+                let debugger = Debugger::init(child, elf);
                 Ok(debugger)
             }
             ForkResult::Child => {
@@ -121,11 +104,11 @@ impl Debugger {
         }
     }
 
-    fn init(p: Pid, exe: PathBuf) -> Self {
+    fn init(p: Pid, elf: ElfBytes<'a, AnyEndian>) -> Self {
         Self {
             breakpoints: HashMap::new(),
             debugee_pid: p,
-            exe,
+            elf,
             first_sigtrap: true,
         }
     }
@@ -188,12 +171,13 @@ impl Debugger {
         let mut fd = File::open(self.exe.clone())?;
         let mut header = [0u8; 2];
 
-        fd.read_exact_at(&mut header, ELF_TYPE)?;
+        // E_TYPE HEADER.
+        fd.read_exact_at(&mut header, 0x10)?;
 
         let ep = self.find_entrypoint(&mut fd)?;
 
         match u16::from_le_bytes(header) {
-            ET_DYN => {
+            abi::ET_DYN => {
                 log::debug!(
                     "PIE enabled, calculating entrypoint address using header address as offset."
                 );
@@ -202,7 +186,7 @@ impl Debugger {
                 let ep = base_addr + ep as u64;
                 self.set_breakpoint(ep)?;
             }
-            ET_EXEC => {
+            abi::ET_EXEC => {
                 log::debug!(
                     "PIE not enabled, attempting to set breakpoint using raw header address."
                 );
@@ -242,40 +226,40 @@ impl Debugger {
     /// This is the memory address or the *offset* of the entry point from where the process starts executing.
     /// This field is either 32 or 64 bits long, depending on the format defined earlier (byte 0x04).
     /// If the file doesn't have an associated entry point, then this holds zero.
-    fn find_entrypoint(&self, fd: &mut File) -> Result<usize, DebuggerError> {
-        match fd.get_arch() {
-            Arch::B32 => {
-                log::info!("Provided binary is 32bit.");
-
-                // This field is either 32 or 64 bits long, depending on the architecture.
-                let mut header = [0u8; 4];
-
-                fd.read_exact_at(&mut header, 0x18)?;
-
-                let addr = u32::from_le_bytes(header);
-                log::info!("EntryPoint at 0x{:x}", addr);
-                return Ok(addr as usize);
-            }
-            Arch::B64 => {
-                log::info!("Provided binary is 64bit.");
-
-                // This field is either 32 or 64 bits long, depending on the architecture.
-                let mut header = [0u8; 8];
-
-                fd.read_exact_at(&mut header, 0x18)?;
-
-                let addr = u64::from_le_bytes(header);
-                log::info!("EntryPoint at 0x{:x}", addr); // why is it printing as 32bit.
-                return Ok(addr as usize);
-            }
-            Arch::Invalid => {
-                log::error!("Invalid Binary, Could not read ELF Header.");
-            }
-        }
-
-        Ok(0)
-    }
-
+    // fn find_entrypoint(&self, fd: &mut File) -> Result<usize, DebuggerError> {
+    //     match fd.get_arch() {
+    //         Arch::B32 => {
+    //             log::info!("Provided binary is 32bit.");
+    //
+    //             // This field is either 32 or 64 bits long, depending on the architecture.
+    //             let mut header = [0u8; 4];
+    //
+    //             fd.read_exact_at(&mut header, 0x18)?;
+    //
+    //             let addr = u32::from_le_bytes(header);
+    //             log::info!("EntryPoint at 0x{:x}", addr);
+    //             return Ok(addr as usize);
+    //         }
+    //         Arch::B64 => {
+    //             log::info!("Provided binary is 64bit.");
+    //
+    //             // This field is either 32 or 64 bits long, depending on the architecture.
+    //             let mut header = [0u8; 8];
+    //
+    //             fd.read_exact_at(&mut header, 0x18)?;
+    //
+    //             let addr = u64::from_le_bytes(header);
+    //             log::info!("EntryPoint at 0x{:x}", addr); // why is it printing as 32bit.
+    //             return Ok(addr as usize);
+    //         }
+    //         Arch::Invalid => {
+    //             log::error!("Invalid Binary, Could not read ELF Header.");
+    //         }
+    //     }
+    //
+    //     Ok(0)
+    // }
+    //
     fn handle_stopped_process(&mut self, pid: Pid, signal: Signal) -> Result<(), DebuggerError> {
         // put rip back one byte.
         // get the original byte back.
