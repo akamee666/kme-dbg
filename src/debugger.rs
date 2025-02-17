@@ -70,7 +70,6 @@ pub struct Debugger<'a, E>
 where
     E: EndianParse,
 {
-    // u8 is used because 0xCC only replace one byte.
     breakpoints: HashMap<u64, u8>, // Address and the replaced byte.
     debugee_pid: Pid,
     elf: ElfBytes<'a, E>,
@@ -78,8 +77,12 @@ where
 }
 
 impl<'a> Debugger<'a, AnyEndian> {
-    // elf_data needs a lifetime 'a because ElfBytes holds a reference to elf raw sliced data
-    // inside it.
+    // elf_data needs a lifetime 'a because ElfBytes holds a reference to the ELF raw sliced data
+    // in it.
+    // WARN:
+    // Dont know what i am doing here tbh, dont really understand the ElfCrate.
+    // I am using AnyEndian but i have no idea what would happen if i tried to debug a binary if a
+    // byte order different from the debuger. Hope my pc doesn't explode HAHA :D
     pub fn launch(elf_data: &'a [u8], exe: PathBuf) -> Result<Self, DebuggerError> {
         // Parse Elf information.
         // If it does not fail we have a valid ELF.
