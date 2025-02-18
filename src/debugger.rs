@@ -1,3 +1,6 @@
+use elf::abi::SHN_UNDEF;
+use elf::abi::SHT_STRTAB;
+use elf::abi::SHT_SYMTAB;
 use elf::endian::EndianParse;
 use elf::ParseError;
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
@@ -10,7 +13,6 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::io::{self};
-use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
@@ -80,7 +82,6 @@ impl<'a> Debugger<'a, AnyEndian> {
     // elf_data needs a lifetime 'a because ElfBytes holds a reference to the ELF raw sliced data
     // in it.
     // WARN:
-    // Dont know what i am doing here tbh, dont really understand the ElfCrate.
     // I am using AnyEndian but i have no idea what would happen if i tried to debug a binary if a
     // byte order different from the debuger. Hope my pc doesn't explode HAHA :D
     pub fn launch(elf_data: &'a [u8], exe: PathBuf) -> Result<Self, DebuggerError> {
@@ -101,7 +102,7 @@ impl<'a> Debugger<'a, AnyEndian> {
 
                 let _ = std::process::Command::new(exe).exec();
 
-                // This line will never be reached because `exec` replaces the current process image
+                // This line will never be reached because `exec` replaces the current process image.
                 unreachable!("Failed to execute the target executable");
             }
         }
@@ -171,35 +172,50 @@ impl<'a> Debugger<'a, AnyEndian> {
     /// to calculate the EP address using offset from the header and the BaseAddress, see:
     /// Runtime EntryPoint = PIE Base Address + EntryPoint Offset
     pub fn break_entrypoint(&mut self) -> Result<(), DebuggerError> {
-        let mut fd = File::open(self.exe.clone())?;
-        let mut header = [0u8; 2];
+        // Try to find main symbol first.
+        // if we not have symbols, find by address in EntryPoint header.
+        // let ep = self.find_entrypoint(&mut fd)?;
+        let sh_table = self.elf.section_headers();
 
-        // E_TYPE HEADER.
-        fd.read_exact_at(&mut header, 0x10)?;
+        match sh_table {
+            Some(sh_table) => {
+                // This will just print bullshit because it only owns the raw data.
+                // log::debug!("Found section header table: {shdrs:#?}");
 
-        let ep = self.find_entrypoint(&mut fd)?;
+                for (x, header) in sh_table.iter().enumerate() {
+                    match header.sh_type {
+                        SHT_SYMTAB => {
+                            log::info!("Found .symtab, header number: {x}");
 
-        match u16::from_le_bytes(header) {
-            abi::ET_DYN => {
-                log::debug!(
-                    "PIE enabled, calculating entrypoint address using header address as offset."
-                );
-                let base_addr = self.get_base_address()?;
-                log::info!("Found BaseAddress: 0x{base_addr:x}");
-                let ep = base_addr + ep as u64;
-                self.set_breakpoint(ep)?;
+                            log::info!(".symtab: {header:#?}");
+                        }
+                        SHT_STRTAB => {
+                            // debugee.rs has three string tables, am i dumb for not understanding
+                            // why?
+                            log::info!("Found .strtab, header number: {x}");
+                            log::info!(".strtab: {header:#?}");
+                        }
+                        _ => {
+                            // log::debug!("Header {x} inside SectionHeader Table: {header:?}");
+                        }
+                    }
+                }
+
+                // Contains index of the section header table entry that contains the section names.
+                // That means, our string table?
+                if self.elf.ehdr.e_shstrndx == SHN_UNDEF {
+                    log::warn!("String table not valid?");
+                };
             }
-            abi::ET_EXEC => {
-                log::debug!(
-                    "PIE not enabled, attempting to set breakpoint using raw header address."
-                );
-                self.set_breakpoint(ep as u64)?;
-            }
+            // That means the binary is most likely stripped and we would need to find the
+            // EntryPoint based on elf headers calculating BaseAddress.
+            None => {
+                log::warn!("Could not find ELF Section Headers, attempting to find the entrypoint using ELF Base Address");
 
-            _ => unimplemented!(),
+                // TODO:
+                // Find EntryPoint by Address.
+            }
         }
-
-        log::info!("Breakpoint at EntryPoint was added.");
 
         Ok(())
     }
@@ -314,8 +330,6 @@ impl<'a> Debugger<'a, AnyEndian> {
     fn handle_child_status(&mut self, status: WaitStatus) -> Result<(), DebuggerError> {
         match status {
             WaitStatus::Exited(pid, exit_code) => {
-                // TODO: Should not finish here and instead let a option to rerun or attach a new
-                // binary.
                 log::debug!("Child process {} exited with code: {}", pid, exit_code);
                 std::process::exit(0);
             }
@@ -326,8 +340,6 @@ impl<'a> Debugger<'a, AnyEndian> {
                     signal,
                     core_dumped
                 );
-                // TODO: Same thing as above, maybe return a specific error and handle it when returned
-                // to let the debugger not finish.
             }
             WaitStatus::Stopped(pid, signal) => {
                 // WARN: I'll remove it later.
