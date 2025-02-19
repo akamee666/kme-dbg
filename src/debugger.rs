@@ -1,8 +1,6 @@
 use elf::abi::SHN_UNDEF;
-use elf::abi::SHT_STRTAB;
-use elf::abi::SHT_SYMTAB;
 use elf::endian::EndianParse;
-use elf::section::SectionHeader;
+use elf::symbol::*;
 use elf::ParseError;
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
@@ -205,47 +203,83 @@ impl<'a> Debugger<'a, AnyEndian> {
                     .unwrap();
 
                 for (x, hdr) in shdr_table.iter().enumerate() {
-                    match hdr.sh_type {
-                        SHT_SYMTAB => {
-                            log::info!("Found .symtab, section header number: {x}");
-                            log::info!(".symtab: {hdr:#?}");
-                            log::info!("Trying to find the name of .symtab in shstrndx");
-                            log::info!(".symtab index at .shstrndx: [{}]", hdr.sh_name);
-                            let name_offset = hdr.sh_name as usize;
-                            if let Some(name_data) = shstr_tab_data.get(name_offset..) {
-                                // Find the null terminator
-                                let null_pos = name_data
-                                    .iter()
-                                    .position(|&b| b == 0)
-                                    .unwrap_or(name_data.len());
+                    log::info!("Found Header in SectionHeader, index: [{x}]");
+                    let name_offset = hdr.sh_name as usize;
+                    if let Some(name_data) = shstr_tab_data.get(name_offset..) {
+                        // Find the null terminator
+                        let null_pos = name_data
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(name_data.len());
 
-                                // Convert the bytes up to the null terminator to a string
-                                let name = std::str::from_utf8(&name_data[..null_pos])
-                                    .unwrap_or("<invalid UTF-8>");
+                        // Convert the bytes up to the null terminator to a string
+                        let name = std::str::from_utf8(&name_data[..null_pos])
+                            .unwrap_or("<invalid UTF-8>");
 
-                                log::info!(
-                                    "Found name of .symtab searching in .shstrndx: {}",
-                                    name
-                                );
+                        match name {
+                            ".strtab" => {
+                                assert_eq!(hdr.sh_type, 0x3);
+                                log::info!(".strtab header: {hdr:#?}");
                             }
-                        }
-                        SHT_STRTAB => {
-                            // debugee.rs has three string tables, am i dumb for not understanding
-                            // why?
-                            log::info!("Found .strtab,  shdr_number: {x}");
-                            log::info!(".strtab: {hdr:#?}");
-                        }
-                        _ => {
-                            // log::debug!("Header {x} inside SectionHeader Table: {header:?}");
+                            ".symtab" => {
+                                assert_eq!(hdr.sh_type, 0x2);
+                                log::info!(".symtab header: {hdr:#?}");
+
+                                // sh_link field in SHT_SYMTAB or SHT_DYNSYM will have a index to
+                                // its correspondent string table(.strtab)
+                                let shstrtb_index = hdr.sh_link as usize;
+                                let symtab_strtab = shdr_table.get(shstrtb_index)?;
+
+                                let strtab_raw = self
+                                    .elf_data
+                                    .get(symtab_strtab.sh_offset as usize..)
+                                    .ok_or("Invalid .symtab offset")
+                                    .unwrap();
+
+                                let symbols_raw = self
+                                    .elf_data
+                                    .get(hdr.sh_offset as usize..)
+                                    .ok_or("Invalid .symtab offset")
+                                    .unwrap();
+
+                                let num_symbols = hdr.sh_size / hdr.sh_entsize;
+                                log::info!("Number of entries in the .symtab: {num_symbols}");
+
+                                for i in 0..num_symbols {
+                                    let sym_offset = i * hdr.sh_entsize;
+
+                                    // Just for clarity.
+                                    // This is the start and tail for one symbol.
+                                    let start = sym_offset as usize;
+                                    let tail = (sym_offset + hdr.sh_entsize) as usize;
+                                    unsafe {
+                                        let sym_data = &*(symbols_raw[start..tail].as_ptr()
+                                            as *const Elf64_Sym);
+
+                                        if let Some(sym_name) =
+                                            strtab_raw.get(sym_data.st_name as usize..)
+                                        {
+                                            let null_pos =
+                                                sym_name.iter().position(|&b| b == 0).unwrap_or(0);
+
+                                            let name = if null_pos == 0 {
+                                                "unknown"
+                                            } else {
+                                                std::str::from_utf8(&sym_name[..null_pos])
+                                                    .unwrap_or("unknown")
+                                            };
+                                            log::info!(
+                                                "Found symbol named: [{name}]: {sym_data:#?}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            &_ => {}
                         }
                     }
                 }
-
-                // Contains index of the section header table entry that contains the section names.
-                // That means, our string table?
-                if self.elf.ehdr.e_shstrndx == SHN_UNDEF {
-                    log::warn!("String table not valid?");
-                };
             }
             // That means the binary is most likely stripped and we would need to find the
             // EntryPoint based on elf headers calculating BaseAddress.
