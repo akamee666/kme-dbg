@@ -2,6 +2,7 @@ use elf::abi::SHN_UNDEF;
 use elf::abi::SHT_STRTAB;
 use elf::abi::SHT_SYMTAB;
 use elf::endian::EndianParse;
+use elf::section::SectionHeader;
 use elf::ParseError;
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
@@ -75,6 +76,7 @@ where
     breakpoints: HashMap<u64, u8>, // Address and the replaced byte.
     debugee_pid: Pid,
     elf: ElfBytes<'a, E>,
+    elf_data: &'a [u8],
     first_sigtrap: bool,
 }
 
@@ -92,7 +94,7 @@ impl<'a> Debugger<'a, AnyEndian> {
         let f = unsafe { fork().map_err(DebuggerError::SystemError)? };
         match f {
             ForkResult::Parent { child } => {
-                let debugger = Debugger::init(child, elf);
+                let debugger = Debugger::init(child, elf, elf_data);
                 Ok(debugger)
             }
             ForkResult::Child => {
@@ -108,12 +110,13 @@ impl<'a> Debugger<'a, AnyEndian> {
         }
     }
 
-    fn init(p: Pid, elf: ElfBytes<'a, AnyEndian>) -> Self {
+    fn init(p: Pid, elf: ElfBytes<'a, AnyEndian>, elf_data: &'a [u8]) -> Self {
         Self {
             breakpoints: HashMap::new(),
             debugee_pid: p,
             elf,
             first_sigtrap: true,
+            elf_data,
         }
     }
 
@@ -175,25 +178,62 @@ impl<'a> Debugger<'a, AnyEndian> {
         // Try to find main symbol first.
         // if we not have symbols, find by address in EntryPoint header.
         // let ep = self.find_entrypoint(&mut fd)?;
-        let sh_table = self.elf.section_headers();
+        let shdr_table = self.elf.section_headers();
 
-        match sh_table {
-            Some(sh_table) => {
+        // Section header string table, this one is different than the symtab for example. Is used to store the name of the sections and
+        // not for the symbols.
+        // This field holds the index of the section header that define the name of the sections, so
+        // that means our .shstrtab
+        if self.elf.ehdr.e_shstrndx == SHN_UNDEF {
+            log::warn!(".shstrtab is undefined");
+        }
+
+        match shdr_table {
+            Some(shdr_table) => {
                 // This will just print bullshit because it only owns the raw data.
                 // log::debug!("Found section header table: {shdrs:#?}");
 
-                for (x, header) in sh_table.iter().enumerate() {
-                    match header.sh_type {
-                        SHT_SYMTAB => {
-                            log::info!("Found .symtab, header number: {x}");
+                let shstrtab = shdr_table.get(self.elf.ehdr.e_shstrndx as usize)?;
+                log::info!("Found .shstrtab: {shstrtab:#?}");
 
-                            log::info!(".symtab: {header:#?}");
+                // Now we have the data of the string table that contains the name of the
+                // sections.
+                let shstr_tab_data = self
+                    .elf_data
+                    .get(shstrtab.sh_offset as usize..)
+                    .ok_or("Invalid .shstrtab offset")
+                    .unwrap();
+
+                for (x, hdr) in shdr_table.iter().enumerate() {
+                    match hdr.sh_type {
+                        SHT_SYMTAB => {
+                            log::info!("Found .symtab, section header number: {x}");
+                            log::info!(".symtab: {hdr:#?}");
+                            log::info!("Trying to find the name of .symtab in shstrndx");
+                            log::info!(".symtab index at .shstrndx: [{}]", hdr.sh_name);
+                            let name_offset = hdr.sh_name as usize;
+                            if let Some(name_data) = shstr_tab_data.get(name_offset..) {
+                                // Find the null terminator
+                                let null_pos = name_data
+                                    .iter()
+                                    .position(|&b| b == 0)
+                                    .unwrap_or(name_data.len());
+
+                                // Convert the bytes up to the null terminator to a string
+                                let name = std::str::from_utf8(&name_data[..null_pos])
+                                    .unwrap_or("<invalid UTF-8>");
+
+                                log::info!(
+                                    "Found name of .symtab searching in .shstrndx: {}",
+                                    name
+                                );
+                            }
                         }
                         SHT_STRTAB => {
                             // debugee.rs has three string tables, am i dumb for not understanding
                             // why?
-                            log::info!("Found .strtab, header number: {x}");
-                            log::info!(".strtab: {header:#?}");
+                            log::info!("Found .strtab,  shdr_number: {x}");
+                            log::info!(".strtab: {hdr:#?}");
                         }
                         _ => {
                             // log::debug!("Header {x} inside SectionHeader Table: {header:?}");
